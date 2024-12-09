@@ -108,10 +108,10 @@ class EstimatorQNN(NeuralNetwork):
     def __init__(
         self,
         *,
-        circuit: QuantumCircuit,
+        circuit: QuantumCircuit | Sequence[QuantumCircuit],
         estimator: BaseEstimator | BaseEstimatorV2 | None = None,
         observables: Sequence[BaseOperator] | BaseOperator | None = None,
-        input_params: Sequence[Parameter] | None = None,
+        input_params: Sequence[Parameter] | Sequence[Sequence[Parameter]] | None = None,
         weight_params: Sequence[Parameter] | None = None,
         gradient: BaseEstimatorGradient | None = None,
         input_gradients: bool = False,
@@ -166,21 +166,34 @@ class EstimatorQNN(NeuralNetwork):
             )
         self.estimator = estimator
 
-        if hasattr(circuit.layout, "_input_qubit_count"):
-            self.num_virtual_qubits = circuit.layout._input_qubit_count
-        else:
-            if pass_manager is None:
-                self.num_virtual_qubits = circuit.num_qubits
-            else:
-                circuit = pass_manager.run(circuit)
-                self.num_virtual_qubits = circuit.layout._input_qubit_count
+        self._dynamic_feature_map: bool = isinstance(circuit, Sequence)
 
-        self._org_circuit = circuit
+        # Reshape the circuit variable for dynamical case
+        if not self._dynamic_feature_map:
+            circuit = [circuit]
+
+        self.num_virtual_qubits = 0
+        circuit_with_layout = []
+        for circuit_idx, circuit_ in enumerate(circuit):
+
+            if not hasattr(circuit_.layout, "_input_qubit_count"):
+                if pass_manager is None:
+                    num_virtual_qubits_ = circuit_.num_qubits
+                    circuit_with_layout.append(circuit_)
+                else:
+                    # If pass manager has not been run, transpile the circuit(s)
+                    circuit_transpiled = pass_manager.run(circuit_)
+                    num_virtual_qubits_ = circuit_transpiled.layout._input_qubit_count
+                    circuit_with_layout.append(circuit_transpiled)
+
+            self.num_virtual_qubits = max(num_virtual_qubits_, self.num_virtual_qubits)
+
+        self._org_circuit = circuit_with_layout if self._dynamic_feature_map else circuit_with_layout[0]
 
         if observables is None:
             observables = SparsePauliOp.from_sparse_list(
                 [("Z" * self.num_virtual_qubits, range(self.num_virtual_qubits), 1)],
-                num_qubits=self.circuit.num_qubits,
+                num_qubits=self.num_virtual_qubits,
             )
 
         if isinstance(observables, BaseOperator):
@@ -188,12 +201,23 @@ class EstimatorQNN(NeuralNetwork):
 
         self._observables = observables
 
-        if isinstance(circuit, QNNCircuit):
-            self._input_params = list(circuit.input_parameters)
-            self._weight_params = list(circuit.weight_parameters)
+        # Handle input_params as a sequence of sequences
+        if self._dynamic_feature_map:
+            self._input_params = [
+                list(input_param) if input_param is not None else []
+                for input_param in input_params
+            ]
+            self._weight_params = [
+                list(weight_param) if weight_param is not None else []
+                for weight_param in weight_params
+            ] if weight_params else []
         else:
-            self._input_params = list(input_params) if input_params is not None else []
-            self._weight_params = list(weight_params) if weight_params is not None else []
+            if isinstance(circuit, QNNCircuit):
+                self._input_params = list(circuit.input_parameters)
+                self._weight_params = list(circuit.weight_parameters)
+            else:
+                self._input_params = list(input_params) if input_params is not None else []
+                self._weight_params = list(weight_params) if weight_params is not None else []
 
         # set gradient
         if gradient is None:
@@ -211,15 +235,23 @@ class EstimatorQNN(NeuralNetwork):
         self.gradient = gradient
         self._input_gradients = input_gradients
 
+        # Super initialization
         super().__init__(
-            num_inputs=len(self._input_params),
-            num_weights=len(self._weight_params),
+            num_inputs=len(self._input_params) if not self._dynamic_feature_map else sum(len(params) for params in self._input_params),
+            num_weights=len(self._weight_params) if not self._dynamic_feature_map else sum(len(params) for params in self._weight_params),
             sparse=False,
             output_shape=len(self._observables),
             input_gradients=input_gradients,
         )
 
-        self._circuit = self._reparameterize_circuit(circuit, input_params, weight_params)
+        # Handle re-parameterization of circuits
+        if self._dynamic_feature_map:
+            self._circuit = [
+                self._reparameterize_circuit(circuit_, input_param, weight_param)
+                for circuit_, input_param, weight_param in zip(circuit, input_params, weight_params)
+            ]
+        else:
+            self._circuit = self._reparameterize_circuit(circuit, input_params, weight_params)
 
     @property
     def circuit(self) -> QuantumCircuit:
