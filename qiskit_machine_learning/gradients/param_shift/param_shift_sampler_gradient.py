@@ -19,7 +19,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from qiskit.circuit import Parameter, QuantumCircuit
-
+from qiskit import generate_preset_pass_manager
 from qiskit.primitives import BaseSamplerV1
 from qiskit.primitives.base import BaseSamplerV2
 from qiskit.result import QuasiDistribution
@@ -78,82 +78,128 @@ class ParamShiftSamplerGradient(BaseSamplerGradient):
         parameters: Sequence[Sequence[Parameter]],
         **options,
     ) -> SamplerGradientResult:
-        """Compute the sampler gradients on the given circuits.
-        Raises:
-            AlgorithmError: If an invalid ``sampler``provided or if sampler job failed.
-        """
-        job_circuits, job_param_values, metadata = [], [], []
-        all_n = []
-        for circuit, parameter_values_, parameters_ in zip(circuits, parameter_values, parameters):
-            metadata.append({"parameters": parameters_})
-            # Make parameter values for the parameter shift rule.
-            param_shift_parameter_values = _make_param_shift_parameter_values(
-                circuit, parameter_values_, parameters_
+        """Compute sampler gradients in small batches with finite shots."""
+        # build flat list of all shifted circuits
+        job_circuits: list[QuantumCircuit] = []
+        job_param_values: list[dict[Parameter, float]] = []
+        metadata: list[dict[str, Sequence[Parameter]]] = []
+        all_n: list[int] = []
+
+        for circ, vals, params in zip(circuits, parameter_values, parameters):
+            metadata.append({"parameters": params})
+            shifts = _make_param_shift_parameter_values(circ, vals, params)
+            n_shifts = len(shifts)
+            all_n.append(n_shifts)
+            job_circuits.extend([circ] * n_shifts)
+            job_param_values.extend(shifts)
+
+        total_shifts = sum(all_n)
+        if total_shifts == 0:
+            return SamplerGradientResult(
+                gradients=[[] for _ in circuits],
+                metadata=metadata,
+                options=options,
             )
-            # Combine inputs into a single job to reduce overhead.
-            n = len(param_shift_parameter_values)
-            job_circuits.extend([circuit] * n)
-            job_param_values.extend(param_shift_parameter_values)
-            all_n.append(n)
 
-        # Run the single job with all circuits.
-        if isinstance(self._sampler, BaseSamplerV1):
-            job = self._sampler.run(job_circuits, job_param_values, **options)
-        elif isinstance(self._sampler, BaseSamplerV2):
-            if self._pass_manager is None:
-                _circs = job_circuits
-                _len_quasi_dist = 2 ** job_circuits[0].num_qubits
-            else:
-                _circs = self._pass_manager.run(job_circuits)
-                _len_quasi_dist = 2 ** _circs[0].layout._input_qubit_count
-            circ_params = [(_circs[i], job_param_values[i]) for i in range(len(job_param_values))]
-            job = self._sampler.run(circ_params)
-        else:
-            raise AlgorithmError(
-                "The accepted estimators are BaseSamplerV1 (deprecated) and BaseSamplerV2; got "
-                + f"{type(self._sampler)} instead."
-            )
-        try:
-            results = job.result()
-        except Exception as exc:
-            raise AlgorithmError("Sampler job failed.") from exc
+        # force finite shots for BaseSamplerV2
+        run_opts = options.copy()
+        run_opts.setdefault("shots", 1024)
+        batch_size = run_opts.pop("batch_size", 10)
 
-        # Compute the gradients.
-        gradients = []
-        partial_sum_n = 0
-        opt = None  # Required by PyLint: possibly-used-before-assignment
-        for n in all_n:
-            gradient = []
+        # pre-transpile each original circuit once
+        pm = generate_preset_pass_manager(backend=None)
+        transpiled_map: dict[int, QuantumCircuit] = {}
+        for idx, orig in enumerate(circuits):
+            transpiled_map[idx] = pm.run(orig)
 
+        # prepare sparse gradient storage
+        gradients: list[list[dict[int, float]]] = [[] for _ in circuits]
+
+        # stream through shifts in batches
+        processed = 0
+        partial_sum = 0  # tracks how many shifts from previous circuits
+        circ_idx = 0
+        shift_accum = 0
+
+        while processed < total_shifts:
+            end = min(processed + batch_size, total_shifts)
+            sub_circs: list[QuantumCircuit] = []
+            sub_vals: list[dict[Parameter, float]] = []
+
+            # bind each shift in this batch to its transpiled circuit
+            idx = processed
+            temp_circ_idx = circ_idx
+            temp_shift_accum = shift_accum
+            while idx < end:
+                # move forward to correct circuit block
+                while temp_shift_accum + all_n[temp_circ_idx] <= idx:
+                    temp_shift_accum += all_n[temp_circ_idx]
+                    temp_circ_idx += 1
+                offset = idx - temp_shift_accum
+                base = transpiled_map[temp_circ_idx]
+                bind = job_param_values[idx]
+                bound = base.assign_parameters(bind, inplace=False)
+                sub_circs.append(bound)
+                sub_vals.append(bind)
+                idx += 1
+
+            # run this batch
             if isinstance(self._sampler, BaseSamplerV1):
-                result = results.quasi_dists[partial_sum_n : partial_sum_n + n]
-                opt = self._get_local_options(options)
-
+                sub_job = self._sampler.run(sub_circs, sub_vals, **run_opts)
+                sub_res = sub_job.result()
+                sub_quasi = sub_res.quasi_dists
             elif isinstance(self._sampler, BaseSamplerV2):
-                result = []
-                for i in range(partial_sum_n, partial_sum_n + n):
-                    if hasattr(results[i].data, "meas"):
-                        bitstring_counts = results[i].data.meas.get_counts()
-                    else:
-                        # Fallback to 'c' if 'meas' is not available.
-                        bitstring_counts = results[i].data.c.get_counts()
-                    # Normalize the counts to probabilities
-                    total_shots = sum(bitstring_counts.values())
-                    probabilities = {k: v / total_shots for k, v in bitstring_counts.items()}
+                if self._pass_manager:
+                    sub_circs = self._pass_manager.run(sub_circs)
+                n_qubits = sub_circs[0].num_qubits
+                cutoff = 2 ** n_qubits
+                circ_params = [(sub_circs[i], sub_vals[i]) for i in range(len(sub_circs))]
+                sub_job = self._sampler.run(circ_params, **run_opts)
+                sub_res = sub_job.result()
+                sub_quasi = []
+                for r in sub_res:
+                    data = r.data
+                    counts = data.meas.get_counts() if hasattr(data, "meas") else data.c.get_counts()
+                    total = sum(counts.values())
+                    probs = {bs: cnt / total for bs, cnt in counts.items()}
+                    filtered = {int(bs, 2): p for bs, p in probs.items() if int(bs, 2) < cutoff}
+                    sub_quasi.append(filtered)
+            else:
+                raise AlgorithmError(
+                    "Accepted estimators are BaseSamplerV1 and BaseSamplerV2; got "
+                    f"{type(self._sampler)}."
+                )
 
-                    # Convert to quasi-probabilities
-                    counts = QuasiDistribution(probabilities)
-                    result.append({k: v for k, v in counts.items() if int(k) < _len_quasi_dist})
-                    opt = options
+            # assemble gradients from this batch
+            local_start = processed
+            temp_circ_idx = circ_idx
+            temp_shift_accum = shift_accum
+            idx2 = processed
+            for i in range(len(sub_quasi)):
+                # find circuit index for this flattened shift
+                while temp_shift_accum + all_n[temp_circ_idx] <= idx2:
+                    temp_shift_accum += all_n[temp_circ_idx]
+                    temp_circ_idx += 1
+                offset = idx2 - temp_shift_accum
+                half = all_n[temp_circ_idx] // 2
+                param_slot = offset % half
+                is_minus = offset // half
+                grad_dict = gradients[temp_circ_idx]
+                if offset == 0:
+                    grad_dict.extend([{} for _ in range(half)])
+                factor = 0.5 if is_minus == 0 else -0.5
+                for key, prob in sub_quasi[i].items():
+                    grad_dict[param_slot][key] = grad_dict[param_slot].get(key, 0.0) + factor * prob
+                idx2 += 1
 
-            for dist_plus, dist_minus in zip(result[: n // 2], result[n // 2 :]):
-                grad_dist: dict[int, float] = defaultdict(float)
-                for key, val in dist_plus.items():
-                    grad_dist[key] += val / 2
-                for key, val in dist_minus.items():
-                    grad_dist[key] -= val / 2
-                gradient.append(dict(grad_dist))
-            gradients.append(gradient)
-            partial_sum_n += n
+            # advance processed counters to next batch
+            processed = end
+            # update circ_idx and shift_accum
+            while circ_idx < len(all_n) and shift_accum + all_n[circ_idx] <= processed:
+                shift_accum += all_n[circ_idx]
+                circ_idx += 1
 
-        return SamplerGradientResult(gradients=gradients, metadata=metadata, options=opt)
+            # free batch memory
+            del sub_quasi, sub_res, sub_job
+
+        return SamplerGradientResult(gradients=gradients, metadata=metadata, options=options)
