@@ -136,15 +136,6 @@ class ParamShiftSamplerGradient(BaseSamplerGradient):
                     f"{type(self._sampler)}."
                 )
 
-            # print sizes of large arrays (in MB)
-            size_circs = sys.getsizeof(batch_circs) / (1024 ** 2)
-            size_params = sys.getsizeof(batch_params) / (1024 ** 2)
-            size_res = sys.getsizeof(batch_res) / (1024 ** 2)
-            print(f"Batch {batch_idx + 1}/{num_batches}: "
-                  f"batch_circuits = {size_circs:.2f} MB | {len(batch_circs)=}, "
-                  f"batch_params = {size_params:.2f} MB | {len(batch_params)=}, "
-                  f"batch_results = {size_res:.2f} MB | {len(batch_res)=}")
-
             # process each result in batch
             for local_idx, res in enumerate(batch_res):
                 global_idx = start + local_idx
@@ -181,5 +172,6 @@ class ParamShiftSamplerGradient(BaseSamplerGradient):
                     gradients[circ_idx] = grads
                     # free buffer
                     buffers[circ_idx] = []
+
 
         return SamplerGradientResult(gradients=gradients, metadata=metadata, options=opt)
